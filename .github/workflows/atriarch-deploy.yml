@@ -41,7 +41,10 @@ jobs:
           fetch-depth: 0
 
       - name: Mark workspace safe for git
-        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+        # Use --system: searx/version.py runs git in a subprocess with a stripped
+        # env (no HOME), so a --global safe.directory is never read. System config
+        # (/etc/gitconfig) is honored regardless of HOME.
+        run: git config --system --add safe.directory '*'
 
       - name: Generate image tag
         id: meta
