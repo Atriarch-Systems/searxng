@@ -1,0 +1,139 @@
+# Atriarch: build SearXNG from source and deploy to the cluster.
+#
+# Triggered on push to the `atriarch` branch. Builds the two-stage container
+# (container/builder.dockerfile -> container/dist.dockerfile) the same way the
+# upstream `make container.build` does, pushes it to the Nexus registry, then
+# bumps the image tag in the GitOps repo so ArgoCD redeploys.
+#
+# Org-level secrets (inherited from the Atriarch-Systems org):
+#   DOCKER_REGISTRY, DOCKER_USERNAME, DOCKER_PASSWORD, GITOPS_TOKEN
+# Org-level variables (fallbacks provided below):
+#   GITOPS_REPO (Atriarch-Systems/atriarch-argo-state), GITOPS_BRANCH (production)
+name: Atriarch Build & Deploy
+
+on:
+  push:
+    branches: [atriarch]
+  workflow_dispatch:
+
+env:
+  IMAGE_NAME: searxng
+  GITOPS_FILE_PATH: atriarch-utility/searxng.yml
+
+jobs:
+  build-and-push:
+    name: 🐳 Build & Push
+    runs-on: [self-hosted, linux, amd64]
+    container:
+      image: docker:24-dind
+      options: --privileged
+      volumes:
+        - /var/run/docker.sock:/var/run/docker.sock
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - name: Install build tooling
+        run: apk add --no-cache git python3 bash coreutils
+
+      - name: Checkout (full history needed for version freeze)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Mark workspace safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Generate image tag
+        id: meta
+        run: echo "tag=v1.0.${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+
+      - name: Freeze SearXNG version (writes searx/version_frozen.py)
+        run: python3 -m searx.version freeze
+
+      - name: Compute reproducible build timestamps
+        id: ts
+        run: |
+          tr_main=$(git log -1 --format=%ct ./requirements.txt)
+          tr_srv=$(git log -1 --format=%ct ./requirements-server.txt)
+          if [ "$tr_main" -ge "$tr_srv" ]; then ts_venv="$tr_main"; else ts_venv="$tr_srv"; fi
+          ts_settings=$(git log -1 --format=%ct ./searx/settings.yml)
+          echo "venv=$ts_venv" >> "$GITHUB_OUTPUT"
+          echo "settings=$ts_settings" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to Nexus registry
+        run: echo "${{ secrets.DOCKER_PASSWORD }}" | docker login "${{ secrets.DOCKER_REGISTRY }}" -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
+
+      # Stage 1: builder image (BuildKit cache mounts require BuildKit, which is
+      # the default for `docker build` on Docker 24). Tagged exactly as the dist
+      # stage's `FROM localhost/searxng/searxng:builder` expects.
+      - name: Build builder image
+        run: |
+          docker build \
+            --build-arg TIMESTAMP_VENV=${{ steps.ts.outputs.venv }} \
+            --build-arg TIMESTAMP_SETTINGS=${{ steps.ts.outputs.settings }} \
+            --tag localhost/searxng/searxng:builder \
+            --file ./container/builder.dockerfile \
+            .
+
+      # Stage 2: dist image. Resolves the builder image from the local daemon
+      # store (default docker driver), pulls only ghcr.io/searxng/base.
+      - name: Build dist image
+        run: |
+          docker build \
+            --build-arg CONTAINER_IMAGE_ORGANIZATION=searxng \
+            --build-arg CONTAINER_IMAGE_NAME=searxng \
+            --build-arg CREATED="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --build-arg VERSION=${{ steps.meta.outputs.tag }} \
+            --build-arg VCS_URL="${{ github.server_url }}/${{ github.repository }}" \
+            --build-arg VCS_REVISION=${{ github.sha }} \
+            --tag "${{ secrets.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.tag }}" \
+            --tag "${{ secrets.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}:latest" \
+            --file ./container/dist.dockerfile \
+            .
+
+      - name: Push images
+        run: |
+          docker push "${{ secrets.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.tag }}"
+          docker push "${{ secrets.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+
+      - name: Cleanup local images
+        if: always()
+        run: |
+          docker rmi "${{ secrets.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.tag }}" || true
+          docker rmi "${{ secrets.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}:latest" || true
+          docker rmi localhost/searxng/searxng:builder || true
+
+  update-gitops:
+    name: 📦 Update GitOps
+    needs: build-and-push
+    runs-on: [self-hosted, linux, amd64]
+    container:
+      image: alpine/git:latest
+    steps:
+      - name: Checkout GitOps repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.GITOPS_REPO || 'Atriarch-Systems/atriarch-argo-state' }}
+          token: ${{ secrets.GITOPS_TOKEN }}
+          ref: ${{ vars.GITOPS_BRANCH || 'production' }}
+          path: gitops
+
+      - name: Bump image tag in manifest
+        working-directory: gitops
+        env:
+          TAG: ${{ needs.build-and-push.outputs.image_tag }}
+          REGISTRY: ${{ secrets.DOCKER_REGISTRY }}
+        run: |
+          sed -i "s|image: ${REGISTRY}/searxng:.*|image: ${REGISTRY}/searxng:${TAG}|g" "${{ env.GITOPS_FILE_PATH }}"
+          grep -n "image: ${REGISTRY}/searxng:" "${{ env.GITOPS_FILE_PATH }}" || true
+
+      - name: Commit & push
+        working-directory: gitops
+        env:
+          TAG: ${{ needs.build-and-push.outputs.image_tag }}
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git add "${{ env.GITOPS_FILE_PATH }}"
+          git diff --staged --quiet || git commit -m "chore(searxng): update image to ${TAG}"
+          git push
