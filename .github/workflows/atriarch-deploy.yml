@@ -48,7 +48,10 @@ jobs:
         run: echo "tag=v1.0.${{ github.run_number }}" >> "$GITHUB_OUTPUT"
 
       - name: Freeze SearXNG version (writes searx/version_frozen.py)
-        run: python3 -m searx.version freeze
+        # Run version.py as a file, not `-m searx.version`: the latter imports the
+        # searx package (searx/__init__.py -> msgspec), which isn't installed in
+        # the build container. As a script it falls back to the git-based version.
+        run: python3 searx/version.py freeze
 
       - name: Compute reproducible build timestamps
         id: ts
